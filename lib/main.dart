@@ -1,8 +1,102 @@
 import 'dart:math';
+import 'package:activation_codes/activation_codes.dart' as ac;
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const RuneDayApp());
+}
+
+// ─────────────────────────────────────────────────────────────
+// Task 089: Premium-статус и активация кодов.
+// ─────────────────────────────────────────────────────────────
+
+class PremiumService {
+  PremiumService._();
+  static final PremiumService instance = PremiumService._();
+
+  static const _kPremium = 'rune_premium_v1';
+  static const _kPremiumExpiry = 'rune_premium_expiry_v1';
+
+  final ValueNotifier<bool> isPremium = ValueNotifier<bool>(false);
+
+  Future<void> init() async {
+    final p = await SharedPreferences.getInstance();
+    final premium = p.getBool(_kPremium) ?? false;
+    final expiryMs = p.getInt(_kPremiumExpiry);
+    if (premium && expiryMs != null) {
+      final expiry = DateTime.fromMillisecondsSinceEpoch(expiryMs);
+      if (DateTime.now().isAfter(expiry)) {
+        await _clearPremium();
+        return;
+      }
+    }
+    isPremium.value = premium;
+  }
+
+  Future<void> activatePremium(DateTime? expiresAt) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kPremium, true);
+    if (expiresAt != null) {
+      await p.setInt(_kPremiumExpiry, expiresAt.millisecondsSinceEpoch);
+    }
+    isPremium.value = true;
+  }
+
+  Future<void> _clearPremium() async {
+    final p = await SharedPreferences.getInstance();
+    await p.remove(_kPremium);
+    await p.remove(_kPremiumExpiry);
+    isPremium.value = false;
+  }
+}
+
+/// Активация кодов для Руны (appId: RUNA).
+class RuneCodeService {
+  RuneCodeService._();
+  static final RuneCodeService instance = RuneCodeService._();
+
+  static const _appId = 'RUNA';
+  static const _appCode = 3;
+  static const _key = String.fromEnvironment('CODE_KEY', defaultValue: '');
+  static const _serverUrl = String.fromEnvironment('BILLING_API_URL', defaultValue: '');
+
+  static const Map<String, int> _types = {
+    'PREMIUM_MONTH': 1,
+    'PREMIUM_YEAR': 2,
+  };
+
+  late final ac.CodeBackend _backend;
+
+  Future<void> init() async {
+    if (_key.isEmpty) return;
+    final local = ac.LocalCodeBackend(
+      appId: _appId,
+      appCode: _appCode,
+      types: _types,
+      key: _key,
+    );
+    if (_serverUrl.isNotEmpty) {
+      final server = ac.ServerCodeBackend(baseUrl: _serverUrl, appId: _appId);
+      _backend = ac.SmartCodeBackend(local: local, server: server, appId: _appId);
+    } else {
+      _backend = local;
+    }
+  }
+
+  bool get isReady => _key.isNotEmpty;
+
+  Future<ac.CodeResult> redeem(String code) => _backend.redeem(code);
+
+  Future<void> applyCodeResult(ac.CodeResult result) async {
+    if (!result.ok) return;
+    final typeKey = result.typeKey;
+    if (typeKey == null) return;
+    // PREMIUM_MONTH / PREMIUM_YEAR → premium
+    if (typeKey == 'PREMIUM_MONTH' || typeKey == 'PREMIUM_YEAR') {
+      await PremiumService.instance.activatePremium(result.expiresAt);
+    }
+  }
 }
 
 class Rune {
@@ -288,6 +382,9 @@ class _RuneScreenState extends State<RuneScreen>
   bool _showCollection = false;
   DateTime? _lastDrawDate;
   final Set<String> _collected = {};
+  int _drawCountToday = 0;
+  static const _maxDrawsPerDay = 1;
+  static const _maxDrawsPremium = 3;
   late AnimationController _animController;
   late Animation<double> _fadeAnim;
   late Animation<double> _scaleAnim;
@@ -305,14 +402,49 @@ class _RuneScreenState extends State<RuneScreen>
     _scaleAnim = Tween<double>(begin: 0.6, end: 1).animate(
       CurvedAnimation(parent: _animController, curve: Curves.elasticOut),
     );
+    _loadState();
+    _initServices();
   }
 
+  Future<void> _initServices() async {
+    await PremiumService.instance.init();
+    await RuneCodeService.instance.init();
+  }
+
+  Future<void> _loadState() async {
+    final p = await SharedPreferences.getInstance();
+    final lastMs = p.getInt('rune_last_draw_ms');
+    if (lastMs != null) {
+      _lastDrawDate = DateTime.fromMillisecondsSinceEpoch(lastMs);
+      final now = DateTime.now();
+      if (_lastDrawDate!.year == now.year &&
+          _lastDrawDate!.month == now.month &&
+          _lastDrawDate!.day == now.day) {
+        _drawCountToday = p.getInt('rune_draw_count') ?? 0;
+      }
+    }
+    final collected = p.getStringList('rune_collected') ?? [];
+    setState(() => _collected.addAll(collected));
+  }
+
+  Future<void> _saveState() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setInt('rune_last_draw_ms', DateTime.now().millisecondsSinceEpoch);
+    await p.setInt('rune_draw_count', _drawCountToday);
+    await p.setStringList('rune_collected', _collected.toList());
+  }
+
+  int get _maxDraws => PremiumService.instance.isPremium.value
+      ? _maxDrawsPremium
+      : _maxDrawsPerDay;
+
   bool get _canDrawToday {
-    if (_lastDrawDate == null) return true;
     final now = DateTime.now();
-    return _lastDrawDate!.year != now.year ||
+    if (_lastDrawDate == null) return true;
+    if (_lastDrawDate!.year != now.year ||
         _lastDrawDate!.month != now.month ||
-        _lastDrawDate!.day != now.day;
+        _lastDrawDate!.day != now.day) return true;
+    return _drawCountToday < _maxDraws;
   }
 
   void _drawRune() {
@@ -328,27 +460,70 @@ class _RuneScreenState extends State<RuneScreen>
         _todayRune = rune;
         _collected.add(rune.id);
         _lastDrawDate = DateTime.now();
+        _drawCountToday++;
         _isDrawing = false;
       });
       _animController.reset();
       _animController.forward();
+      _saveState();
     });
   }
 
   void _showLimitDialog() {
+    final isPremium = PremiumService.instance.isPremium.value;
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Руна уже вытянута', textAlign: TextAlign.center),
-        content: const Text(
-          'Сегодня ты уже получила свой знак.\nНовая руна будет доступна завтра.',
+        title: const Text('Лимит вытягиваний', textAlign: TextAlign.center),
+        content: Text(
+          isPremium
+              ? 'Сегодня ты вытянула $_maxDrawsPremium руны.\nНовые — завтра.'
+              : 'Сегодня ты уже вытянула руну.\nPremium — до $_maxDrawsPremium вытягиваний в день.\n\nАктивируйте код для Premium.',
           textAlign: TextAlign.center,
+        ),
+        actions: [
+          if (!isPremium)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _showCodeDialog();
+              },
+              child: const Text('Ввести код', style: TextStyle(color: Color(0xFFE8B4D9))),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Понятно', style: TextStyle(color: Color(0xFFE8B4D9))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showCodeDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Активация Premium', textAlign: TextAlign.center),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ac.ActivationCodeField(
+            onRedeem: (code) async {
+              final r = await RuneCodeService.instance.redeem(code);
+              if (r.ok) {
+                await RuneCodeService.instance.applyCodeResult(r);
+              }
+              return r;
+            },
+            accentColor: const Color(0xFFE8B4D9),
+            hintText: 'RUNA-PREMIUM-...',
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('Понятно', style: TextStyle(color: Color(0xFFE8B4D9))),
+            child: const Text('Закрыть', style: TextStyle(color: Color(0xFFE8B4D9))),
           ),
         ],
       ),
@@ -396,12 +571,31 @@ class _RuneScreenState extends State<RuneScreen>
                       ),
                     ],
                   ),
-                  IconButton(
-                    icon: Icon(
-                      _showCollection ? Icons.auto_awesome : Icons.grid_view,
-                      color: const Color(0xFFE8B4D9),
-                    ),
-                    onPressed: () => setState(() => _showCollection = !_showCollection),
+                  Row(
+                    children: [
+                      // Task 089: индикатор Premium + активация кода
+                      ValueListenableBuilder<bool>(
+                        valueListenable: PremiumService.instance.isPremium,
+                        builder: (context, isPremium, _) {
+                          return IconButton(
+                            icon: Icon(
+                              isPremium ? Icons.workspace_premium : Icons.lock_outline,
+                              color: isPremium
+                                  ? const Color(0xFFE8B4D9)
+                                  : Colors.black26,
+                            ),
+                            onPressed: () => _showCodeDialog(),
+                          );
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          _showCollection ? Icons.auto_awesome : Icons.grid_view,
+                          color: const Color(0xFFE8B4D9),
+                        ),
+                        onPressed: () => setState(() => _showCollection = !_showCollection),
+                      ),
+                    ],
                   ),
                 ],
               ),
